@@ -2,6 +2,8 @@
 
 A Windows tool that scans your user folders (Documents, Desktop, Pictures, Videos, Music, Downloads, AppData) for large or unused files, lists them, and lets you choose what to delete. Files go to the Recycle Bin by default.
 
+<img width="1002" height="594" alt="Screenshot 2026-11-11 213907" src="https://github.com/user-attachments/assets/05f6e19f-2339-430f-9ae3-b1f48d349bd1" />
+
 ## Run from source
 
 ```
