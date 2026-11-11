@@ -19,6 +19,8 @@ Safety rules
   Caches/temp folders only lose their files older than the chosen days, and
   permanently, because they are regenerated.
 * Junctions / symlinks and cloud-only OneDrive placeholders are never followed.
+* Folders you add under "Excluded folders..." are never scanned, listed or deleted
+  (the list is saved between runs).
 
 Run:  python windows_cleaner.py      (Python 3.8+, Windows, no extra packages)
 """
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import glob
+import json
 import os
 import queue
 import shutil
@@ -41,7 +44,7 @@ from functools import lru_cache
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 except ImportError:  # lets the core logic be imported/tested without a GUI
     tk = None
 
@@ -91,6 +94,70 @@ PROTECTED = {_norm(x) for x in (
     "", "AppData", "AppData/Local", "AppData/Roaming",
     "AppData/LocalLow", "Documents", "Desktop", "Downloads", "Pictures", "Videos", "Music")}
 
+# ----------------------------------------------------------- exclusions ----
+# Folders the user asked us to leave alone. Anything inside them is never
+# scanned, listed or deleted, and nothing that contains one is deleted either.
+
+_EXCLUDED = ()      # normalised folder keys, replaced as a whole (thread safe)
+
+
+def _key(path):
+    p = os.path.normcase(os.path.abspath(path))
+    return p if len(p) <= 3 else p.rstrip("\\/")
+
+
+def _prefix(key):
+    return key if key.endswith(os.sep) else key + os.sep
+
+
+def set_exclusions(paths):
+    """Activate the given folders as exclusions."""
+    global _EXCLUDED
+    _EXCLUDED = tuple(dict.fromkeys(_key(p) for p in paths if p))
+
+
+def is_excluded(path):
+    """True when path is an excluded folder or lives inside one."""
+    if not _EXCLUDED:
+        return False
+    k = _key(path)
+    return any(k == e or k.startswith(_prefix(e)) for e in _EXCLUDED)
+
+
+def contains_excluded(path):
+    """True when path is, or has inside it, an excluded folder."""
+    if not _EXCLUDED:
+        return False
+    k = _key(path)
+    return any(e == k or e.startswith(_prefix(k)) for e in _EXCLUDED)
+
+
+def exclusions_file():
+    return (os.environ.get("CLEANER_EXCLUDE_FILE")
+            or os.path.join(os.environ.get("APPDATA") or HOME, "JunkCleaner", "excluded_folders.json"))
+
+
+def load_exclusions():
+    try:
+        with open(exclusions_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        return [p for p in data if isinstance(p, str) and p]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_exclusions(paths):
+    """Returns True when the list could be written."""
+    try:
+        f = exclusions_file()
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(list(paths), fh, indent=2, ensure_ascii=False)
+        return True
+    except OSError:
+        return False
+
+
 _FOLDER_IDS = {
     "Documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
     "Desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
@@ -135,7 +202,7 @@ def scan_roots():
 
     def add(path, dl=False, ad=False):
         path = os.path.abspath(path)
-        if not os.path.isdir(path):
+        if not os.path.isdir(path) or is_excluded(path):
             return
         key = os.path.normcase(path)
         for r, _, _ in roots:
@@ -244,7 +311,8 @@ def dir_stats(path, stop=None, cutoff=None):
                         if getattr(st, "st_file_attributes", 0) & REPARSE or e.is_symlink():
                             continue
                         if e.is_dir(follow_symlinks=False):
-                            stack.append(e.path)
+                            if not is_excluded(e.path):
+                                stack.append(e.path)
                         else:
                             last = max(st.st_mtime, st.st_atime)
                             if cutoff is None or last < cutoff:
@@ -290,7 +358,7 @@ class Scanner(threading.Thread):
             for p in glob.glob(pattern):
                 if self.stop.is_set():
                     return
-                if not os.path.isdir(p):
+                if not os.path.isdir(p) or is_excluded(p):
                     continue
                 self.junk_paths.add(os.path.normcase(os.path.abspath(p)))
                 self.q.put(("progress", f"Checking {p}"))
@@ -328,6 +396,8 @@ class Scanner(threading.Thread):
                         n = e.name.lower()
                         if n == ".git" or os.path.normcase(e.path) in self.junk_paths:
                             continue
+                        if is_excluded(e.path):
+                            continue
                         if n in DEV_DIRS:
                             if n == "__pycache__":
                                 self._dev_dir(e.path, d, n, in_dl, in_ad)
@@ -346,6 +416,8 @@ class Scanner(threading.Thread):
                     self.q.put(("progress", f"Scanning... {self.seen:,} entries  ({d})"))
 
     def _dev_dir(self, path, parent, name, in_dl, in_ad):
+        if contains_excluded(path):      # the user protects something inside it
+            return
         size, newest = dir_stats(path, self.stop)
         if size < LISTING_MIN:
             return
@@ -492,6 +564,11 @@ def _purge_contents(path, cutoff=None):
         return 1
     for e in children:
         try:
+            if is_excluded(e.path):
+                continue
+            if contains_excluded(e.path):         # keep it, clean around the protected part
+                failed += _purge_contents(e.path, cutoff)
+                continue
             if cutoff is None:
                 _remove_path(e.path)
                 continue
@@ -513,6 +590,10 @@ def _purge_contents(path, cutoff=None):
 
 
 def check_deletable(it):
+    if is_excluded(it.path):
+        raise ValueError("excluded folder")
+    if not it.contents_only and contains_excluded(it.path):
+        raise ValueError("contains an excluded folder")
     p = os.path.normcase(os.path.abspath(it.path))
     home = os.path.normcase(HOME)
     roots = [home] + [os.path.normcase(os.path.abspath(x)) for _, x in known_folders()]
@@ -618,6 +699,8 @@ if tk is not None:
             self.busy = False
             self.sort_state = ("size", True)
             self.dark = tk.BooleanVar(value=system_is_dark())
+            self.exclusions = load_exclusions()
+            set_exclusions(self.exclusions)
             self._build()
             self._apply_theme()
             self.after(100, self._poll)
@@ -665,6 +748,8 @@ if tk is not None:
             self.scan_btn.pack(side="left", padx=12)
             self.stop_btn = ttk.Button(top, text="Stop", command=self.stop.set, state="disabled")
             self.stop_btn.pack(side="left")
+            self.excl_btn = ttk.Button(top, text="Excluded folders…", command=self.manage_exclusions)
+            self.excl_btn.pack(side="left", padx=12)
             ttk.Checkbutton(top, text="Dark mode", variable=self.dark,
                             command=self._apply_theme).pack(side="right")
 
@@ -688,6 +773,7 @@ if tk is not None:
             self.menu = tk.Menu(self, tearoff=0)
             self.menu.add_command(label="Show in Explorer", command=self.open_location)
             self.menu.add_command(label="Tick / untick", command=self._toggle_selected_rows)
+            self.menu.add_command(label="Exclude this folder from scans", command=self.exclude_selected)
 
             bar = ttk.Frame(self, padding=8)
             bar.pack(fill="x")
@@ -848,6 +934,83 @@ if tk is not None:
                              reverse=desc)
             for idx, it in enumerate(ordered):
                 self.tree.move(it.iid, "", idx)
+
+        # ---- excluded folders
+        def _apply_exclusions(self, new_list):
+            """Activate + save the exclusion list and drop affected rows from the results."""
+            self.exclusions = list(new_list)
+            set_exclusions(self.exclusions)
+            saved = save_exclusions(self.exclusions)
+            for iid, it in list(self.items.items()):
+                if is_excluded(it.path) or (not it.contents_only and contains_excluded(it.path)):
+                    self.tree.delete(iid)
+                    self.items.pop(iid)
+                    self.checked.discard(iid)
+            self._update_summary()
+            self.status.set(f"{len(self.exclusions)} excluded folder(s)."
+                            + ("" if saved else " Could not save the list - it will be lost when you close the app."))
+
+        def _add_exclusions(self, folders):
+            have = {_key(p) for p in self.exclusions}
+            new = [os.path.normpath(f) for f in folders if f and _key(f) not in have]
+            if new:
+                self._apply_exclusions(self.exclusions + new)
+            return bool(new)
+
+        def exclude_selected(self):
+            folders = []
+            for iid in self.tree.selection():
+                it = self.items.get(iid)
+                if it:
+                    folders.append(it.path if it.is_dir else os.path.dirname(it.path))
+            if not folders:
+                return
+            shown = "\n".join(folders[:6]) + (f"\n… and {len(folders) - 6} more" if len(folders) > 6 else "")
+            if messagebox.askyesno("Exclude folders",
+                                   f"Never scan or delete these folders again?\n\n{shown}"):
+                self._add_exclusions(folders)
+
+        def manage_exclusions(self):
+            t = THEMES["dark" if self.dark.get() else "light"]
+            win = tk.Toplevel(self)
+            win.title("Excluded folders")
+            win.geometry("640x340")
+            win.configure(bg=t["bg"])
+            win.transient(self)
+            ttk.Label(win, text="These folders (and everything inside them) are never scanned, listed or deleted.",
+                      padding=8).pack(anchor="w")
+            body = ttk.Frame(win, padding=(8, 0))
+            body.pack(fill="both", expand=True)
+            lb = tk.Listbox(body, selectmode="extended", activestyle="none", bg=t["field"], fg=t["fg"],
+                            selectbackground=t["sel"], selectforeground=t["sel_fg"],
+                            highlightthickness=1, highlightbackground=t["border"], relief="flat")
+            sb = ttk.Scrollbar(body, orient="vertical", command=lb.yview)
+            lb.configure(yscrollcommand=sb.set)
+            lb.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+
+            def refresh():
+                lb.delete(0, "end")
+                for p in self.exclusions:
+                    lb.insert("end", p)
+
+            def add():
+                folder = filedialog.askdirectory(parent=win, title="Folder to exclude", mustexist=True)
+                if folder and self._add_exclusions([folder]):
+                    refresh()
+
+            def remove():
+                drop = {self.exclusions[i] for i in lb.curselection()}
+                if drop:
+                    self._apply_exclusions([p for p in self.exclusions if p not in drop])
+                    refresh()
+
+            btns = ttk.Frame(win, padding=8)
+            btns.pack(fill="x")
+            ttk.Button(btns, text="Add folder…", command=add).pack(side="left")
+            ttk.Button(btns, text="Remove selected", command=remove).pack(side="left", padx=6)
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            refresh()
 
         # ---- actions
         def open_location(self):

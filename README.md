@@ -12,6 +12,10 @@ python windows_cleaner.py
 
 Requires Python 3.8+ on Windows. No extra packages.
 
+## Excluded folders
+
+Click **Excluded folders...** to add any folder on your PC (any drive) that must be left alone. Excluded folders and everything inside them are never scanned, listed or deleted, and nothing that contains one is deleted either. You can also right-click a result and choose **Exclude this folder from scans**. The list is saved in `%APPDATA%\JunkCleaner\excluded_folders.json`.
+
 ## Build the .exe with GitHub
 
 - Every push to `main` builds `JunkCleaner.exe`. Download it from the run's **Artifacts** (Actions tab).
