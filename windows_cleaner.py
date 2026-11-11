@@ -187,6 +187,39 @@ class Item:
         return max(0.0, (time.time() - self.last_used) / DAY)
 
 
+VENDORS = {"google", "microsoft", "mozilla", "jetbrains", "adobe", "apple", "apple computer"}
+APPDATA_SPECIAL = {"temp": "Windows Temp", "crashdumps": "Windows Crash Dumps",
+                   "d3dscache": "Windows (DirectX)", "inetcache": "Windows Internet Cache"}
+
+
+def software_name(it):
+    """Best guess of the software or folder an item belongs to."""
+    path = os.path.abspath(it.path)
+    parent = os.path.basename(os.path.dirname(path)) or os.path.basename(path)
+    try:
+        rel = os.path.relpath(path, HOME)
+    except ValueError:                      # different drive
+        return parent
+    if rel.startswith(".."):
+        return parent                       # known folder moved outside the profile
+    parts = [p for p in rel.replace("\\", "/").split("/") if p]
+    if not parts:
+        return parent
+    first = parts[0].lower()
+    if first == "appdata" and len(parts) >= 3:
+        name = parts[2]
+        if name.lower() in APPDATA_SPECIAL:
+            return APPDATA_SPECIAL[name.lower()]
+        if name.lower() in VENDORS and len(parts) >= 4:
+            return f"{name} {parts[3]}"
+        return name
+    if first.startswith(".") and len(parts) > 1:   # .gradle, .nuget, .m2 ...
+        return parts[0].lstrip(".").capitalize()
+    if os.path.basename(path).lower() in DEV_DIRS:  # project that owns the dependencies
+        return parent
+    return parent if not it.is_dir or it.contents_only else os.path.basename(path)
+
+
 def human(n):
     n = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -543,11 +576,31 @@ def run_delete(items, permanent, q):
 
 # ------------------------------------------------------------------- GUI ----
 
+THEMES = {
+    "light": dict(bg="#f0f0f0", fg="#1a1a1a", field="#ffffff", sel="#cce4ff", sel_fg="#000000",
+                  head="#e1e1e1", border="#c8c8c8", safe="#1a7f37", review="#9a6700"),
+    "dark": dict(bg="#1e1e1e", fg="#e6e6e6", field="#252526", sel="#094771", sel_fg="#ffffff",
+                 head="#333337", border="#3c3c3c", safe="#4ec36b", review="#e3b341"),
+}
+
+
+def system_is_dark():
+    """True when Windows is set to dark app mode."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except Exception:
+        return False
+
+
 if tk is not None:
 
     class App(tk.Tk):
         COLS = [
-            ("sel", "✓", 40, "center"), ("path", "Path", 420, "w"),
+            ("sel", "✓", 40, "center"), ("path", "Path", 380, "w"),
+            ("app", "Software / Folder", 150, "w"),
             ("size", "Size", 80, "e"), ("last", "Last used", 95, "center"),
             ("cat", "Category", 120, "w"), ("why", "Why flagged", 300, "w"),
             ("risk", "Risk", 65, "center"),
@@ -564,8 +617,38 @@ if tk is not None:
             self.counter = 0
             self.busy = False
             self.sort_state = ("size", True)
+            self.dark = tk.BooleanVar(value=system_is_dark())
             self._build()
+            self._apply_theme()
             self.after(100, self._poll)
+
+        def _apply_theme(self):
+            t = THEMES["dark" if self.dark.get() else "light"]
+            st = ttk.Style(self)
+            st.theme_use("clam")
+            self.configure(bg=t["bg"])
+            st.configure(".", background=t["bg"], foreground=t["fg"], fieldbackground=t["field"],
+                         bordercolor=t["border"], lightcolor=t["bg"], darkcolor=t["bg"],
+                         troughcolor=t["bg"], focuscolor=t["bg"])
+            st.configure("TButton", background=t["head"], foreground=t["fg"], padding=4)
+            st.map("TButton", background=[("active", t["sel"]), ("disabled", t["bg"])],
+                   foreground=[("disabled", t["border"])])
+            st.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
+            st.map("TCheckbutton", background=[("active", t["bg"])])
+            st.configure("TSpinbox", fieldbackground=t["field"], foreground=t["fg"],
+                         background=t["head"], arrowcolor=t["fg"])
+            st.configure("TScrollbar", background=t["head"], arrowcolor=t["fg"], troughcolor=t["bg"])
+            st.configure("Treeview", background=t["field"], fieldbackground=t["field"],
+                         foreground=t["fg"], rowheight=22)
+            st.map("Treeview", background=[("selected", t["sel"])],
+                   foreground=[("selected", t["sel_fg"])])
+            st.configure("Treeview.Heading", background=t["head"], foreground=t["fg"], relief="flat")
+            st.map("Treeview.Heading", background=[("active", t["sel"])])
+            self.tree.tag_configure("safe", foreground=t["safe"])
+            self.tree.tag_configure("review", foreground=t["review"])
+            self.menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
+                                activeforeground=t["sel_fg"])
+            self.option_add("*TCombobox*Listbox.background", t["field"])
 
         # ---- layout
         def _build(self):
@@ -582,6 +665,8 @@ if tk is not None:
             self.scan_btn.pack(side="left", padx=12)
             self.stop_btn = ttk.Button(top, text="Stop", command=self.stop.set, state="disabled")
             self.stop_btn.pack(side="left")
+            ttk.Checkbutton(top, text="Dark mode", variable=self.dark,
+                            command=self._apply_theme).pack(side="right")
 
             mid = ttk.Frame(self, padding=(8, 0))
             mid.pack(fill="both", expand=True)
@@ -679,7 +764,7 @@ if tk is not None:
         def _row(it, checked):
             last = time.strftime("%Y-%m-%d", time.localtime(it.last_used)) if it.last_used else "?"
             path = it.path + (f"  (files older than {it.min_age_days:g} days)" if it.contents_only else "")
-            return ("☑" if checked else "☐", path, human(it.size), last,
+            return ("☑" if checked else "☐", path, software_name(it), human(it.size), last,
                     it.category, it.reason, "Safe" if it.risk == "safe" else "Review")
 
         # ---- selection
@@ -754,7 +839,7 @@ if tk is not None:
             self.sort_state = (col, desc)
             keyf = {
                 "size": lambda i: i.size, "last": lambda i: i.last_used,
-                "path": lambda i: i.path.lower(), "cat": lambda i: i.category,
+                "path": lambda i: i.path.lower(), "app": lambda i: software_name(i).lower(), "cat": lambda i: i.category,
                 "why": lambda i: i.reason, "risk": lambda i: i.risk,
                 "sel": lambda i: i.iid in self.checked,
             }[col]
