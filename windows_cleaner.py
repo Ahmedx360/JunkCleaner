@@ -41,7 +41,7 @@ from functools import lru_cache
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import font as tkfont, messagebox, ttk
 except ImportError:  # lets the core logic be imported/tested without a GUI
     tk = None
 
@@ -220,6 +220,77 @@ def software_name(it):
     return parent if not it.is_dir or it.contents_only else os.path.basename(path)
 
 
+def bold(text):
+    """Treeview cells can't be styled individually, so use Unicode bold letters."""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D400 + o - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(0x1D41A + o - 97))
+        elif "0" <= ch <= "9":
+            out.append(chr(0x1D7CE + o - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class CellTip:
+    """Small popup showing the full text of a Treeview cell that is cut off."""
+
+    def __init__(self, tree, plain):
+        self.tree, self.plain = tree, plain      # plain(iid, col) -> full text
+        self.win = self.label = None
+        self.where = None
+        self.job = None
+        tree.bind("<Motion>", self._motion, add="+")
+        tree.bind("<Leave>", lambda e: self.hide(), add="+")
+        tree.bind("<ButtonPress>", lambda e: self.hide(), add="+")
+        tree.bind("<MouseWheel>", lambda e: self.hide(), add="+")
+
+    def colors(self, bg, fg, border):
+        self.bg, self.fg, self.border = bg, fg, border
+
+    def _motion(self, e):
+        tree = self.tree
+        if tree.identify_region(e.x, e.y) != "cell":
+            return self.hide()
+        iid, col = tree.identify_row(e.y), tree.identify_column(e.x)
+        if not iid or col == "#1":
+            return self.hide()
+        if (iid, col) == self.where:
+            return
+        self.hide()
+        self.where = (iid, col)
+        self.job = tree.after(350, lambda: self._show(iid, col, e.x_root, e.y_root))
+
+    def _show(self, iid, col, x, y):
+        if self.where != (iid, col):
+            return
+        key = self.tree["columns"][int(col[1:]) - 1]
+        text = self.plain(iid, key)
+        font = tkfont.nametofont(ttk.Style(self.tree).lookup("Treeview", "font") or "TkDefaultFont")
+        if not text or font.measure(text) + 12 <= int(self.tree.column(key, "width")):
+            return                                 # fits, nothing is cut off
+        self.win = tk.Toplevel(self.tree)
+        self.win.wm_overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        tk.Label(self.win, text=text, justify="left", wraplength=700, bg=self.bg, fg=self.fg,
+                 relief="solid", bd=1, highlightbackground=self.border,
+                 padx=6, pady=3).pack()
+        self.win.wm_geometry(f"+{x + 14}+{y + 18}")
+
+    def hide(self):
+        self.where = None
+        if self.job:
+            self.tree.after_cancel(self.job)
+            self.job = None
+        if self.win:
+            self.win.destroy()
+            self.win = None
+
+
 def human(n):
     n = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -385,7 +456,6 @@ class Scanner(threading.Thread):
             return
         age = int((self.now - last) / DAY)
         ext = os.path.splitext(name)[1]
-        pre = "AppData " if in_ad else ""
 
         def emit(cat, reason, risk):
             if in_ad:
@@ -399,9 +469,9 @@ class Scanner(threading.Thread):
             emit("Old archive", f"Archive in Downloads, unused {age} days", "review")
         elif size >= self.min_size:
             if size >= LARGE_FILE:
-                emit(pre + "Large & unused", f"{human(size)} and unused for {age} days", "review")
+                emit("Large & unused", f"{human(size)} and unused for {age} days", "review")
             else:
-                emit(pre + "Old file", f"Not used for {age} days", "review")
+                emit("Old file", f"Not used for {age} days", "review")
 
 
 # ------------------------------------------------------- smart selection ----
@@ -649,6 +719,7 @@ if tk is not None:
             self.menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
                                 activeforeground=t["sel_fg"])
             self.option_add("*TCombobox*Listbox.background", t["field"])
+            self.tip.colors(t["head"], t["fg"], t["border"])
 
         # ---- layout
         def _build(self):
@@ -685,6 +756,7 @@ if tk is not None:
             self.tree.bind("<space>", self._on_space)
             self.tree.bind("<Double-1>", lambda e: self.open_location())
             self.tree.bind("<Button-3>", self._on_right_click)
+            self.tip = CellTip(self.tree, self._cell_text)
             self.menu = tk.Menu(self, tearoff=0)
             self.menu.add_command(label="Show in Explorer", command=self.open_location)
             self.menu.add_command(label="Tick / untick", command=self._toggle_selected_rows)
@@ -760,11 +832,19 @@ if tk is not None:
             self.items[it.iid] = it
             self.tree.insert("", "end", iid=it.iid, tags=(it.risk,), values=self._row(it, False))
 
+        def _cell_text(self, iid, key):
+            it = self.items.get(iid)
+            if it is None:
+                return ""
+            if key == "app":
+                return software_name(it)             # plain text for the popup
+            return str(self.tree.set(iid, key))
+
         @staticmethod
         def _row(it, checked):
             last = time.strftime("%Y-%m-%d", time.localtime(it.last_used)) if it.last_used else "?"
             path = it.path + (f"  (files older than {it.min_age_days:g} days)" if it.contents_only else "")
-            return ("☑" if checked else "☐", path, software_name(it), human(it.size), last,
+            return ("☑" if checked else "☐", path, bold(software_name(it)), human(it.size), last,
                     it.category, it.reason, "Safe" if it.risk == "safe" else "Review")
 
         # ---- selection
