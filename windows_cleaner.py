@@ -22,10 +22,20 @@ Safety rules
 * Folders you add under "Excluded folders..." are never scanned, listed or deleted
   (the list is saved between runs).
 
+Administrator mode (opt-in)
+* Tick "Include system locations (admin)" to also list C:\\Windows\\Temp, the Windows
+  Update download cache and Windows.old. The app asks Windows for administrator
+  rights (UAC) and restarts itself elevated; nothing outside the user profile is
+  touched unless the box is ticked AND the app is running as administrator.
+* Only those three exact folders are ever allowed; anything else outside your
+  profile is still refused. System items are deleted permanently (no Recycle Bin).
+* Windows.old is never auto-selected and needs its own confirmation.
+
 Run:  python windows_cleaner.py      (Python 3.8+, Windows, no extra packages)
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import glob
 import json
@@ -234,6 +244,103 @@ def scan_roots():
     return roots
 
 
+# ------------------------------------------------------ admin / system ----
+# Opt-in locations outside the user profile. Only the exact folders returned by
+# system_rules() can ever be deleted in admin mode (see check_deletable).
+
+@dataclass(frozen=True)
+class SysRule:
+    path: str
+    category: str
+    reason: str
+    risk: str                 # "safe" | "review"
+    contents_only: bool       # True: empty the folder, keep it. False: remove the folder itself
+    services: tuple = ()      # Windows services stopped while deleting, restarted afterwards
+
+
+def system_rules():
+    """The only system locations admin mode may touch (resolved at call time)."""
+    win = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    drive = os.environ.get("SystemDrive") or os.path.splitdrive(win)[0] or "C:"
+    return [
+        SysRule(os.path.join(win, "Temp"), "System temp", "Windows temp files",
+                "safe", True),
+        SysRule(os.path.join(win, "SoftwareDistribution", "Download"), "Windows Update",
+                "Downloaded update files (re-downloaded when needed)", "safe", True,
+                services=("wuauserv", "bits")),
+        SysRule(os.path.join(drive + os.sep, "Windows.old"), "Windows.old",
+                "Previous Windows installation - deleting it removes the option to roll back",
+                "review", False),
+    ]
+
+
+def is_admin():
+    """True when the process runs elevated (administrator)."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """Ask Windows (UAC prompt) to start this program again as administrator.
+    Returns True when the elevated copy was launched, False when the user said
+    no to the prompt or Windows refused."""
+    try:
+        if getattr(sys, "frozen", False):                  # PyInstaller .exe
+            exe, args = sys.executable, sys.argv[1:]
+        else:
+            exe, args = sys.executable, [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        args = [a for a in args if a != "--admin"] + ["--admin"]
+        res = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe,
+                                                  subprocess.list2cmdline(args), None, 1)
+        return res > 32
+    except Exception:
+        return False
+
+
+def _is_reparse(path):
+    """True for junctions / symlinks (never followed in admin mode)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & REPARSE) or stat.S_ISLNK(st.st_mode)
+
+
+def _run_quiet(cmd):
+    """Run a console tool without a window. Returns its exit code, or -1 if it could not run."""
+    try:
+        return subprocess.run(cmd, capture_output=True,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return -1
+
+
+@contextlib.contextmanager
+def _services_stopped(names):
+    """Stop the given services, and start again only those that this call stopped."""
+    stopped = []
+    try:
+        for n in names:
+            if _run_quiet(["net", "stop", n, "/y"]) == 0:     # 2 = was not running
+                stopped.append(n)
+        yield
+    finally:
+        for n in reversed(stopped):
+            _run_quiet(["net", "start", n])
+
+
+def _force_delete_tree(path):
+    """Delete a folder protected by system ACLs (Windows.old): take ownership,
+    grant Administrators full control, then remove it. Never follows junctions."""
+    _run_quiet(["takeown", "/F", path, "/R", "/D", "Y"])
+    _run_quiet(["icacls", path, "/grant", "*S-1-5-32-544:F", "/T", "/C", "/Q"])
+    _rmtree(path)
+    if os.path.exists(path):
+        raise OSError("some files are in use or protected")
+
+
 @dataclass
 class Item:
     path: str
@@ -248,6 +355,7 @@ class Item:
     iid: str = ""
     in_appdata: bool = False
     min_age_days: float = 0.0   # for contents_only: only files older than this are removed
+    system: bool = False        # admin-mode item outside the user profile (see SysRule)
 
     @property
     def age_days(self):
@@ -261,6 +369,8 @@ APPDATA_SPECIAL = {"temp": "Windows Temp", "crashdumps": "Windows Crash Dumps",
 
 def software_name(it):
     """Best guess of the software or folder an item belongs to."""
+    if it.system:
+        return "Windows"
     path = os.path.abspath(it.path)
     parent = os.path.basename(os.path.dirname(path)) or os.path.basename(path)
     try:
@@ -404,9 +514,10 @@ def dir_stats(path, stop=None, cutoff=None):
 # -------------------------------------------------------------- scanning ----
 
 class Scanner(threading.Thread):
-    def __init__(self, q, min_size_mb, old_days, stop):
+    def __init__(self, q, min_size_mb, old_days, stop, include_system=False):
         super().__init__(daemon=True)
         self.q, self.stop = q, stop
+        self.include_system = include_system
         self.min_size = int(min_size_mb * MB)
         self.old_days = old_days
         self.now = time.time()
@@ -417,11 +528,36 @@ class Scanner(threading.Thread):
     def run(self):
         try:
             self._junk()
+            if self.include_system and is_admin() and not self.stop.is_set():
+                self._system()
             if not self.stop.is_set():
                 self._walk()
         except Exception as exc:  # never let the thread die silently
             self.q.put(("progress", f"Scan error: {exc}"))
         self.q.put(("done", None))
+
+    def _system(self):
+        """Admin mode: the fixed list of system locations, nothing else."""
+        for rule in system_rules():
+            if self.stop.is_set():
+                return
+            p = rule.path
+            if not os.path.isdir(p) or _is_reparse(p) or is_excluded(p):
+                continue
+            if not rule.contents_only and contains_excluded(p):
+                continue
+            self.q.put(("progress", f"Checking {p}"))
+            cutoff = self.cutoff if rule.contents_only else None   # Windows.old: always listed
+            size, newest = dir_stats(p, self.stop, cutoff)
+            if size < LISTING_MIN:
+                continue
+            reason = rule.reason
+            if rule.contents_only:
+                reason += f" - files unused > {self.old_days:g} days"
+            self.q.put(("item", Item(
+                p, size, newest, rule.category, reason, rule.risk,
+                is_dir=True, contents_only=rule.contents_only, system=True,
+                min_age_days=self.old_days if rule.contents_only else 0.0)))
 
     def _junk(self):
         for rel, cat, reason, risk in JUNK:
@@ -550,6 +686,8 @@ class Scanner(threading.Thread):
 
 def smart_pick(it, old_days):
     """True when an item is a good candidate for automatic removal."""
+    if it.system and not it.contents_only:      # Windows.old is always a manual decision
+        return False
     if it.risk == "safe":
         return True
     if it.in_downloads and it.age_days >= old_days:
@@ -659,11 +797,30 @@ def _purge_contents(path, cutoff=None):
     return failed
 
 
+def _check_system(it):
+    """Admin-mode gate: elevated + exactly one of the allowed system folders."""
+    if not is_admin():
+        raise ValueError("administrator rights are required")
+    p = os.path.normcase(os.path.abspath(it.path))
+    for rule in system_rules():
+        if os.path.normcase(os.path.abspath(rule.path)) == p:
+            if it.contents_only != rule.contents_only:
+                raise ValueError("does not match the allowed system rule")
+            if _is_reparse(it.path):
+                raise ValueError("is a link or junction")
+            return rule
+    raise ValueError("not an allowed system location")
+
+
 def check_deletable(it):
+    """Raise ValueError when an item must not be deleted. Returns the matching
+    SysRule for an approved system location, otherwise None."""
     if is_excluded(it.path):
         raise ValueError("excluded folder")
     if not it.contents_only and contains_excluded(it.path):
         raise ValueError("contains an excluded folder")
+    if it.system:
+        return _check_system(it)
     p = os.path.normcase(os.path.abspath(it.path))
     home = os.path.normcase(HOME)
     roots = [home] + [os.path.normcase(os.path.abspath(x)) for _, x in known_folders()]
@@ -685,27 +842,33 @@ def run_delete(items, permanent, q):
     for i, it in enumerate(items, 1):
         q.put(("progress", f"Deleting {i}/{total}…"))
         try:
-            check_deletable(it)
+            rule = check_deletable(it)          # SysRule for admin-mode items, else None
             if not os.path.lexists(it.path):
                 done.append(it)
                 continue
-            if it.contents_only:
-                before = it.size
-                cutoff = time.time() - it.min_age_days * DAY if it.min_age_days else None
-                failed = _purge_contents(it.path, cutoff)
-                after, _ = dir_stats(it.path, cutoff=cutoff)
-                freed += max(0, before - after)
-                it.size = after
-                if after < LISTING_MIN:
+            # services come from the approved rule, never from the item itself
+            with _services_stopped(rule.services if rule else ()):
+                if it.contents_only:
+                    before = it.size
+                    cutoff = time.time() - it.min_age_days * DAY if it.min_age_days else None
+                    failed = _purge_contents(it.path, cutoff)
+                    after, _ = dir_stats(it.path, cutoff=cutoff)
+                    freed += max(0, before - after)
+                    it.size = after
+                    if after < LISTING_MIN:
+                        done.append(it)
+                    if failed:
+                        errors.append(f"{it.path}: {failed} item(s) in use were skipped")
+                elif rule:                      # system folder: permanent, ACLs may block
+                    _force_delete_tree(it.path)
+                    freed += it.size
                     done.append(it)
-                if failed:
-                    errors.append(f"{it.path}: {failed} item(s) in use were skipped")
-            elif permanent:
-                _remove_path(it.path)
-                freed += it.size
-                done.append(it)
-            else:
-                to_recycle.append(it)
+                elif permanent:
+                    _remove_path(it.path)
+                    freed += it.size
+                    done.append(it)
+                else:
+                    to_recycle.append(it)
         except Exception as exc:
             errors.append(f"{it.path}: {exc}")
 
@@ -759,7 +922,7 @@ if tk is not None:
 
         def __init__(self):
             super().__init__()
-            self.title("Windows Cleaner")
+            self.title("Windows Cleaner (Administrator)" if is_admin() else "Windows Cleaner")
             self.geometry("1250x700")
             self.q = queue.Queue()
             self.stop = threading.Event()
@@ -771,6 +934,8 @@ if tk is not None:
             self.dark = tk.BooleanVar(value=system_is_dark())
             self.exclusions = load_exclusions()
             set_exclusions(self.exclusions)
+            # the elevated copy started by _restart_as_admin() comes back with --admin
+            self.include_system = tk.BooleanVar(value=("--admin" in sys.argv and is_admin()))
             self._build()
             self._apply_theme()
             self.after(100, self._poll)
@@ -821,6 +986,9 @@ if tk is not None:
             self.stop_btn.pack(side="left")
             self.excl_btn = ttk.Button(top, text="Excluded folders…", command=self.manage_exclusions)
             self.excl_btn.pack(side="left", padx=12)
+            ttk.Checkbutton(top, text="Include system locations (admin)",
+                            variable=self.include_system,
+                            command=self._on_system_toggle).pack(side="left")
             ttk.Checkbutton(top, text="Dark mode", variable=self.dark,
                             command=self._apply_theme).pack(side="right")
 
@@ -866,6 +1034,29 @@ if tk is not None:
             ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w",
                       padding=4).pack(fill="x", side="bottom")
 
+        # ---- admin mode
+        def _on_system_toggle(self):
+            if not self.include_system.get():
+                return
+            if is_admin():
+                self.status.set("System locations (Windows Temp, Update cache, Windows.old) "
+                                "will be included in the next scan.")
+                return
+            if messagebox.askyesno(
+                    "Administrator rights needed",
+                    "System locations (C:\\Windows\\Temp, the Windows Update download cache "
+                    "and Windows.old) can only be cleaned as administrator.\n\n"
+                    "Windows will ask for your permission, then this app restarts with "
+                    "administrator rights. The current scan results will be lost.\n\n"
+                    "Restart as administrator?", icon="warning"):
+                if relaunch_as_admin():
+                    self.destroy()                  # the elevated copy takes over
+                    return
+                messagebox.showwarning("Administrator rights not granted",
+                                       "Windows did not grant administrator rights, so "
+                                       "system locations stay excluded.")
+            self.include_system.set(False)
+
         # ---- scanning
         def start_scan(self):
             if self.busy:
@@ -884,7 +1075,8 @@ if tk is not None:
                 messagebox.showerror("Invalid settings", "Days and size must be whole numbers of 1 or more.")
                 self._set_busy(False)
                 return
-            Scanner(self.q, mb, days, self.stop).start()
+            Scanner(self.q, mb, days, self.stop,
+                    include_system=self.include_system.get() and is_admin()).start()
             self._update_summary()
 
         def _set_busy(self, busy):
@@ -1128,8 +1320,18 @@ if tk is not None:
                 lines += ["", "Some items are inside AppData: deleting them can reset or break the app that owns them."]
             if any(i.risk == "review" for i in chosen):
                 lines += ["", "Some selected items are marked 'Review' — make sure you don't need them."]
+            if any(i.system for i in chosen):
+                lines += ["", "ADMIN: system items are deleted permanently (not restorable). Windows "
+                              "Update and BITS services are paused briefly and restarted afterwards."]
             if not messagebox.askyesno("Smart clean" if smart else "Confirm delete",
                                        "\n".join(lines), icon="warning"):
+                return
+            if any(i.system and not i.contents_only for i in chosen) and not messagebox.askyesno(
+                    "Delete Windows.old?",
+                    "Windows.old holds your previous Windows installation.\n\n"
+                    "Once it is deleted you can no longer go back to the previous version of "
+                    "Windows, and the deletion cannot be undone.\n\nDelete Windows.old anyway?",
+                    icon="warning", default="no"):
                 return
             self._set_busy(True)
             threading.Thread(target=run_delete, args=(chosen, perm, self.q), daemon=True).start()
