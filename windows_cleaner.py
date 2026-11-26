@@ -1142,8 +1142,7 @@ if tk is not None:
             self.tip.colors(t["head"], t["fg"], t["border"])
             self.storage_canvas.configure(bg=t["bg"])
             self._hide_storage_tooltip()
-            if self.storage_result:
-                self._render_storage_chart()
+            self._render_storage_chart()
 
         # ---- layout
         def _build(self):
@@ -1344,6 +1343,8 @@ if tk is not None:
             canvas = self.storage_canvas
             canvas.delete("all")
             self.storage_segments = []
+            self.storage_chart_geometry = None
+            self.storage_table.delete(*self.storage_table.get_children())
             if not self.storage_result:
                 canvas.create_text(210, 185, text="Analyze a drive to view its storage breakdown",
                                    fill=THEMES["dark" if self.dark.get() else "light"]["fg"],
