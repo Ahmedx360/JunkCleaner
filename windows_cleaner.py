@@ -969,6 +969,30 @@ def storage_bucket(path, drive_root):
     return "Other", os.path.join(drive_root, parts[0])
 
 
+
+def current_user_appdata_path(drive_root):
+    """Resolve the running user's real AppData directory on the selected drive."""
+    drive_key = os.path.normcase(os.path.splitdrive(os.path.abspath(drive_root))[0])
+    candidates = []
+    for variable in ("LOCALAPPDATA", "APPDATA"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(os.path.dirname(os.path.abspath(value)))
+    candidates.append(os.path.join(HOME, "AppData"))
+
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidate_drive = os.path.normcase(os.path.splitdrive(candidate)[0])
+        if candidate_drive == drive_key and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 class StorageScanner(threading.Thread):
     """Read-only whole-drive size scan. It never follows links or deletes files."""
 
@@ -977,6 +1001,7 @@ class StorageScanner(threading.Thread):
         self.q, self.drive, self.stop = q, drive, stop
         self.seen = 0
         self.skipped = 0
+        self.appdata_path = current_user_appdata_path(drive)
 
     def run(self):
         try:
@@ -1012,6 +1037,10 @@ class StorageScanner(threading.Thread):
                                 "name": category, "size": 0, "files": 0, "folders": 0,
                                 "path": location, "description": STORAGE_DESCRIPTIONS[category],
                             })
+                            # The "App data" size aggregates profiles, but navigation should
+                            # open the account running JunkCleaner, not Public/Default.
+                            if category == "App data" and self.appdata_path:
+                                bucket["path"] = self.appdata_path
                             if entry.is_dir(follow_symlinks=False):
                                 bucket["folders"] += 1
                                 stack.append(entry.path)
@@ -1354,8 +1383,9 @@ if tk is not None:
             t = THEMES["dark" if self.dark.get() else "light"]
             canvas.configure(bg=t["bg"])
             categories = self.storage_result["categories"]
-            chart_items = [item for item in categories if item["size"] > 0]
-            pie_total = sum(item["size"] for item in chart_items)
+            chart_items = [(index, item) for index, item in enumerate(categories)
+                           if item["size"] > 0]
+            pie_total = sum(item["size"] for _, item in chart_items)
             if not chart_items or pie_total <= 0:
                 canvas.create_text(210, 185, text="No readable file sizes were found on this drive.",
                                    fill=t["fg"], width=340, justify="center")
@@ -1364,16 +1394,28 @@ if tk is not None:
             cx, cy, radius = 210, 184, 151
             self.storage_chart_geometry = (cx, cy, radius)
             start = 0.0
-            for index, item in enumerate(chart_items):
+            for category_index, item in chart_items:
                 extent = 360.0 * item["size"] / pie_total
                 color = STORAGE_COLORS.get(item["name"], "#888888")
-                arc = canvas.create_arc(cx - radius, cy - radius, cx + radius, cy + radius,
-                                        start=start, extent=extent, style=tk.PIESLICE,
-                                        fill=color, outline=t["bg"], width=2)
-                segment = {"index": index, "start": start, "extent": extent,
-                           "item": item, "arc": arc, "share": item["size"] / pie_total}
+
+                # Draw a separate polygon for each wedge. Canvas arcs can render
+                # overlapping pieslices unexpectedly on some bundled Tk versions.
+                steps = max(2, min(180, int(math.ceil(extent / 2.0))))
+                points = [cx, cy]
+                for step in range(steps + 1):
+                    angle = math.radians(start + extent * step / steps)
+                    points.extend((cx + radius * math.cos(angle),
+                                   cy - radius * math.sin(angle)))
+                wedge = canvas.create_polygon(
+                    *points, fill=color, outline=t["bg"], width=2,
+                    joinstyle=tk.ROUND)
+                segment = {"index": category_index, "start": start, "extent": extent,
+                           "item": item, "arc": wedge, "share": item["size"] / pie_total}
                 self.storage_segments.append(segment)
                 start += extent
+
+            canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                               outline=t["border"], width=1)
 
             canvas.create_text(cx, cy + radius + 24, text=f'Breakdown of {human(pie_total)}',
                                fill=t["fg"], font=("Segoe UI", 9))
@@ -1404,10 +1446,13 @@ if tk is not None:
             return None
 
         def _storage_item(self, index):
-            if not self.storage_result:
+            if not self.storage_result or index is None:
                 return None
+            for segment in self.storage_segments:
+                if segment["index"] == index:
+                    return segment["item"]
             items = self.storage_result["categories"]
-            return items[index] if index is not None and 0 <= index < len(items) else None
+            return items[index] if 0 <= index < len(items) else None
 
         def _storage_canvas_motion(self, event):
             index = self._storage_hit(event.x, event.y)
