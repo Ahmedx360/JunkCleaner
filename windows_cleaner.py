@@ -1001,6 +1001,7 @@ class StorageScanner(threading.Thread):
                             st = entry.stat(follow_symlinks=False)
                             attrs = getattr(st, "st_file_attributes", 0)
                             if entry.is_symlink() or attrs & REPARSE:
+                                self.skipped += 1
                                 continue
                             if attrs & CLOUD_ONLY:
                                 self.skipped += 1
@@ -1135,6 +1136,8 @@ if tk is not None:
             self.tree.tag_configure("review", foreground=t["review"])
             self.menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
                                 activeforeground=t["sel_fg"])
+            self.storage_menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
+                                         activeforeground=t["sel_fg"])
             self.option_add("*TCombobox*Listbox.background", t["field"])
             self.tip.colors(t["head"], t["fg"], t["border"])
             self.storage_canvas.configure(bg=t["bg"])
