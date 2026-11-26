@@ -39,6 +39,7 @@ import contextlib
 import ctypes
 import glob
 import json
+import math
 import os
 import queue
 import shutil
@@ -888,6 +889,162 @@ def run_delete(items, permanent, q):
     q.put(("deleted", (done, freed, errors)))
 
 
+
+
+# ------------------------------------------------------ storage analysis ----
+
+STORAGE_COLORS = {
+    "Windows / system": "#527fc1",
+    "Installed apps": "#39966d",
+    "User files": "#c28b3c",
+    "App data": "#8b6ac8",
+    "Shared app data": "#c56b70",
+    "Recycle Bin": "#4d9ca5",
+    "System reserved": "#7b8794",
+    "Other": "#a77a56",
+    "Unscanned / reserved": "#626b75",
+}
+
+STORAGE_DESCRIPTIONS = {
+    "Windows / system": "Windows installation files, built-in components and the Windows.old folder.",
+    "Installed apps": "Programs installed under Program Files folders.",
+    "User files": "Files in Windows user profiles, excluding AppData.",
+    "App data": "Per-user application settings, caches, databases and other AppData content.",
+    "Shared app data": "Shared application data stored in ProgramData.",
+    "Recycle Bin": "Items currently held in the drive's Recycle Bin.",
+    "System reserved": "System Volume Information, recovery data and paging/hibernation files.",
+    "Other": "Files and folders that do not match one of the named Windows locations.",
+    "Unscanned / reserved": "The difference between Windows-reported used space and readable file sizes. It can include protected files, filesystem metadata and reserved space.",
+}
+
+
+def storage_drives():
+    """Return mounted local fixed/removable drive roots on Windows."""
+    if os.name != "nt":
+        return []
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        roots = []
+        for index in range(26):
+            if not mask & (1 << index):
+                continue
+            root = f"{chr(65 + index)}:\\"
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(root)
+            if drive_type in (2, 3, 6):  # removable, fixed, RAM disk
+                roots.append(root)
+        return roots
+    except Exception:
+        return []
+
+
+def storage_bucket(path, drive_root):
+    """Return (display category, Explorer folder) for one path on a drive."""
+    try:
+        relative = os.path.relpath(path, drive_root)
+    except ValueError:
+        relative = os.path.basename(path)
+    parts = [part for part in relative.replace("\\", "/").split("/") if part and part != "."]
+    if not parts:
+        return "System reserved", drive_root
+
+    first = parts[0].casefold()
+    leaf = parts[-1].casefold()
+    if first in ("windows", "windows.old", "$winreagent"):
+        return "Windows / system", os.path.join(drive_root, parts[0])
+    if first in ("program files", "program files (x86)", "program files (arm)"):
+        return "Installed apps", os.path.join(drive_root, parts[0])
+    if first == "programdata":
+        return "Shared app data", os.path.join(drive_root, parts[0])
+    if first == "$recycle.bin":
+        return "Recycle Bin", os.path.join(drive_root, parts[0])
+    if first == "system volume information" or first in ("recovery", "config.msi", "boot"):
+        return "System reserved", os.path.join(drive_root, parts[0])
+    if leaf in ("pagefile.sys", "hiberfil.sys", "swapfile.sys", "memory.dmp"):
+        return "System reserved", drive_root
+    if first == "users":
+        appdata_at = next((i for i, part in enumerate(parts) if part.casefold() == "appdata"), None)
+        if appdata_at is not None:
+            return "App data", os.path.join(drive_root, *parts[:appdata_at + 1])
+        return "User files", os.path.join(drive_root, parts[0])
+    return "Other", os.path.join(drive_root, parts[0])
+
+
+class StorageScanner(threading.Thread):
+    """Read-only whole-drive size scan. It never follows links or deletes files."""
+
+    def __init__(self, q, drive, stop):
+        super().__init__(daemon=True)
+        self.q, self.drive, self.stop = q, drive, stop
+        self.seen = 0
+        self.skipped = 0
+
+    def run(self):
+        try:
+            result = self._scan()
+        except Exception as exc:
+            self.q.put(("storage_error", str(exc)))
+        else:
+            self.q.put(("storage_done", result))
+
+    def _scan(self):
+        usage = shutil.disk_usage(self.drive)
+        buckets = {}
+        stack = [self.drive]
+        while stack and not self.stop.is_set():
+            directory = stack.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if self.stop.is_set():
+                            break
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            attrs = getattr(st, "st_file_attributes", 0)
+                            if entry.is_symlink() or attrs & REPARSE:
+                                self.skipped += 1
+                                continue
+                            if attrs & CLOUD_ONLY:
+                                self.skipped += 1
+                                continue
+
+                            category, location = storage_bucket(entry.path, self.drive)
+                            bucket = buckets.setdefault(category, {
+                                "name": category, "size": 0, "files": 0, "folders": 0,
+                                "path": location, "description": STORAGE_DESCRIPTIONS[category],
+                            })
+                            if entry.is_dir(follow_symlinks=False):
+                                bucket["folders"] += 1
+                                stack.append(entry.path)
+                            else:
+                                bucket["files"] += 1
+                                bucket["size"] += max(0, int(st.st_size))
+                        except OSError:
+                            self.skipped += 1
+                        self.seen += 1
+                        if self.seen % 3000 == 0:
+                            self.q.put(("storage_progress",
+                                        f"Scanning {self.drive} — {self.seen:,} entries checked, "
+                                        f"{self.skipped:,} skipped…"))
+            except OSError:
+                self.skipped += 1
+
+        scanned = sum(item["size"] for item in buckets.values())
+        used = max(0, int(usage.total - usage.free))
+        remainder = max(0, used - scanned)
+        if remainder:
+            buckets["Unscanned / reserved"] = {
+                "name": "Unscanned / reserved", "size": remainder, "files": 0, "folders": 0,
+                "path": self.drive, "description": STORAGE_DESCRIPTIONS["Unscanned / reserved"],
+            }
+
+        categories = sorted(buckets.values(), key=lambda item: item["size"], reverse=True)
+        return {
+            "drive": self.drive, "total": int(usage.total), "used": used,
+            "free": int(usage.free), "scanned": scanned, "categories": categories,
+            "skipped": self.skipped, "entries": self.seen, "partial": self.stop.is_set(),
+        }
+
+
 # ------------------------------------------------------------------- GUI ----
 
 THEMES = {
@@ -930,6 +1087,15 @@ if tk is not None:
             self.checked = set()
             self.counter = 0
             self.busy = False
+            self.storage_busy = False
+            self.storage_result = None
+            self.storage_segments = []
+            self.storage_chart_geometry = None
+            self.storage_selected_index = None
+            self.storage_hover_index = None
+            self.storage_tooltip = None
+            self.storage_tooltip_label = None
+            self.storage_stop = threading.Event()
             self.sort_state = ("size", True)
             self.dark = tk.BooleanVar(value=system_is_dark())
             self.exclusions = load_exclusions()
@@ -961,17 +1127,33 @@ if tk is not None:
             st.map("Treeview", background=[("selected", t["sel"])],
                    foreground=[("selected", t["sel_fg"])])
             st.configure("Treeview.Heading", background=t["head"], foreground=t["fg"], relief="flat")
+            st.configure("TNotebook", background=t["bg"], borderwidth=0)
+            st.configure("TNotebook.Tab", background=t["head"], foreground=t["fg"], padding=(14, 7))
+            st.map("TNotebook.Tab", background=[("selected", t["field"]), ("active", t["sel"])],
+                   foreground=[("selected", t["fg"])])
             st.map("Treeview.Heading", background=[("active", t["sel"])])
             self.tree.tag_configure("safe", foreground=t["safe"])
             self.tree.tag_configure("review", foreground=t["review"])
             self.menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
                                 activeforeground=t["sel_fg"])
+            self.storage_menu.configure(bg=t["field"], fg=t["fg"], activebackground=t["sel"],
+                                         activeforeground=t["sel_fg"])
             self.option_add("*TCombobox*Listbox.background", t["field"])
             self.tip.colors(t["head"], t["fg"], t["border"])
+            self.storage_canvas.configure(bg=t["bg"])
+            self._hide_storage_tooltip()
+            self._render_storage_chart()
 
         # ---- layout
         def _build(self):
-            top = ttk.Frame(self, padding=8)
+            self.tabs = ttk.Notebook(self)
+            self.tabs.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+            cleaner_page = ttk.Frame(self.tabs)
+            storage_page = ttk.Frame(self.tabs)
+            self.tabs.add(cleaner_page, text="Junk cleaner")
+            self.tabs.add(storage_page, text="Storage usage")
+
+            top = ttk.Frame(cleaner_page, padding=8)
             top.pack(fill="x")
             ttk.Label(top, text="List files & folders NOT used for more than").pack(side="left")
             self.old_days = tk.IntVar(value=365)
@@ -992,7 +1174,7 @@ if tk is not None:
             ttk.Checkbutton(top, text="Dark mode", variable=self.dark,
                             command=self._apply_theme).pack(side="right")
 
-            mid = ttk.Frame(self, padding=(8, 0))
+            mid = ttk.Frame(cleaner_page, padding=(8, 0))
             mid.pack(fill="both", expand=True)
             self.tree = ttk.Treeview(mid, columns=[c[0] for c in self.COLS],
                                      show="headings", selectmode="extended")
@@ -1015,7 +1197,7 @@ if tk is not None:
             self.menu.add_command(label="Tick / untick", command=self._toggle_selected_rows)
             self.menu.add_command(label="Exclude this folder from scans", command=self.exclude_selected)
 
-            bar = ttk.Frame(self, padding=8)
+            bar = ttk.Frame(cleaner_page, padding=8)
             bar.pack(fill="x")
             ttk.Button(bar, text="Select all", command=lambda: self._set_all(True)).pack(side="left")
             ttk.Button(bar, text="Clear", command=lambda: self._set_all(False)).pack(side="left", padx=4)
@@ -1028,6 +1210,69 @@ if tk is not None:
             self.del_btn.pack(side="right")
             self.sum_var = tk.StringVar(value="Nothing selected")
             ttk.Label(bar, textvariable=self.sum_var).pack(side="right", padx=16)
+
+            storage_bar = ttk.Frame(storage_page, padding=10)
+            storage_bar.pack(fill="x")
+            ttk.Label(storage_bar, text="Drive").pack(side="left")
+            drive_values = storage_drives()
+            home_drive = os.path.splitdrive(HOME)[0] + os.sep
+            if home_drive and home_drive not in drive_values:
+                drive_values.insert(0, home_drive)
+            if not drive_values:
+                drive_values = [home_drive or "C:\\"]
+            self.storage_drive = tk.StringVar(value=drive_values[0])
+            self.drive_combo = ttk.Combobox(storage_bar, textvariable=self.storage_drive,
+                                            values=drive_values, width=8, state="readonly")
+            self.drive_combo.pack(side="left", padx=6)
+            self.storage_scan_btn = ttk.Button(storage_bar, text="Analyze storage",
+                                                command=self.start_storage_scan)
+            self.storage_scan_btn.pack(side="left", padx=(6, 4))
+            self.storage_stop_btn = ttk.Button(storage_bar, text="Stop", command=self.storage_stop.set,
+                                                state="disabled")
+            self.storage_stop_btn.pack(side="left")
+            self.storage_status = tk.StringVar(value="Choose a drive and analyze it to see where its space is used.")
+            ttk.Label(storage_bar, textvariable=self.storage_status).pack(side="left", padx=12)
+
+            storage_body = ttk.Frame(storage_page, padding=12)
+            storage_body.pack(fill="both", expand=True)
+            self.storage_canvas = tk.Canvas(storage_body, width=420, height=390,
+                                             highlightthickness=0, bd=0)
+            self.storage_canvas.pack(side="left", padx=(0, 18), anchor="n")
+            self.storage_canvas.bind("<Motion>", self._storage_canvas_motion)
+            self.storage_canvas.bind("<Leave>", lambda _e: self._hide_storage_tooltip())
+            self.storage_canvas.bind("<Button-3>", self._storage_chart_right_click)
+
+            storage_details = ttk.Frame(storage_body)
+            storage_details.pack(side="left", fill="both", expand=True)
+            self.storage_summary = tk.StringVar(value="No storage analysis yet")
+            ttk.Label(storage_details, textvariable=self.storage_summary,
+                      font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 8))
+            self.storage_table = ttk.Treeview(
+                storage_details, columns=("category", "size", "share", "files", "folders"),
+                show="headings", selectmode="browse", height=13)
+            for key, heading, width, anchor in (
+                ("category", "Category", 190, "w"), ("size", "Size", 95, "e"),
+                ("share", "Share", 65, "e"), ("files", "Files", 70, "e"),
+                ("folders", "Folders", 75, "e"),
+            ):
+                self.storage_table.heading(key, text=heading)
+                self.storage_table.column(key, width=width, anchor=anchor, stretch=(key == "category"))
+            self.storage_table.pack(fill="both", expand=True)
+            self.storage_table.bind("<<TreeviewSelect>>", self._storage_table_select)
+            self.storage_table.bind("<Double-1>", lambda _e: self.open_storage_location())
+            self.storage_table.bind("<Button-3>", self._storage_table_right_click)
+            self.storage_hint = tk.StringVar(value="Hover over a pie slice for details. Right-click a slice or row to open its folder.")
+            ttk.Label(storage_details, textvariable=self.storage_hint, wraplength=560,
+                      justify="left").pack(anchor="w", pady=(8, 4))
+            self.storage_note = tk.StringVar(value="The analysis is read-only. It never changes or deletes files.")
+            ttk.Label(storage_details, textvariable=self.storage_note, wraplength=560,
+                      justify="left").pack(anchor="w")
+
+            self.storage_menu = tk.Menu(self, tearoff=0)
+            self.storage_menu.add_command(label="Open location in File Explorer",
+                                           command=self.open_storage_location)
+            self.storage_menu.add_command(label="Copy folder path",
+                                           command=self.copy_storage_location)
 
             self.status = tk.StringVar(value="Scans Documents, Desktop, Pictures, Videos, Music, Downloads and AppData. "
                                              "Green = safe to remove, amber = review first.")
@@ -1056,6 +1301,207 @@ if tk is not None:
                                        "Windows did not grant administrator rights, so "
                                        "system locations stay excluded.")
             self.include_system.set(False)
+
+        # ---- whole-drive storage analysis
+        def start_storage_scan(self):
+            if self.storage_busy:
+                return
+            drive = self.storage_drive.get().strip()
+            if not drive or not os.path.isdir(drive):
+                messagebox.showerror("Storage analysis", "The selected drive is not available.")
+                return
+            self.storage_stop.clear()
+            self._set_storage_busy(True)
+            self.storage_status.set(f"Scanning {drive}…")
+            self.storage_summary.set("Reading directory entries. This can take a while on large drives.")
+            StorageScanner(self.q, drive, self.storage_stop).start()
+
+        def _set_storage_busy(self, busy):
+            self.storage_busy = busy
+            self.storage_scan_btn.config(state="disabled" if busy else "normal")
+            self.storage_stop_btn.config(state="normal" if busy else "disabled")
+            self.drive_combo.config(state="disabled" if busy else "readonly")
+
+        def _storage_scan_done(self, result):
+            self._set_storage_busy(False)
+            self.storage_result = result
+            used_pct = (100.0 * result["used"] / result["total"]) if result["total"] else 0.0
+            self.storage_summary.set(
+                f'{result["drive"]}  •  {human(result["used"])} used of {human(result["total"])} '
+                f'({used_pct:.1f}%)  •  {human(result["free"])} free')
+            details = (f'{result["entries"]:,} entries checked; {result["skipped"]:,} inaccessible, '
+                       f'link or cloud-only entries skipped. '
+                       f'{human(result["scanned"])} of readable logical file sizes were counted.')
+            if result["partial"]:
+                details = "Partial scan — stopped by user. " + details
+            details += " File sizes can differ from allocated disk space because of compression, sparse files and hard links."
+            self.storage_note.set(details)
+            self.storage_status.set("Analysis stopped early." if result["partial"] else "Analysis complete.")
+            self._render_storage_chart()
+
+        def _render_storage_chart(self):
+            canvas = self.storage_canvas
+            canvas.delete("all")
+            self.storage_segments = []
+            self.storage_chart_geometry = None
+            self.storage_table.delete(*self.storage_table.get_children())
+            if not self.storage_result:
+                canvas.create_text(210, 185, text="Analyze a drive to view its storage breakdown",
+                                   fill=THEMES["dark" if self.dark.get() else "light"]["fg"],
+                                   width=340, justify="center", font=("Segoe UI", 11))
+                return
+
+            t = THEMES["dark" if self.dark.get() else "light"]
+            canvas.configure(bg=t["bg"])
+            categories = self.storage_result["categories"]
+            chart_items = [item for item in categories if item["size"] > 0]
+            pie_total = sum(item["size"] for item in chart_items)
+            if not chart_items or pie_total <= 0:
+                canvas.create_text(210, 185, text="No readable file sizes were found on this drive.",
+                                   fill=t["fg"], width=340, justify="center")
+                return
+
+            cx, cy, radius = 210, 184, 151
+            self.storage_chart_geometry = (cx, cy, radius)
+            start = 0.0
+            for index, item in enumerate(chart_items):
+                extent = 360.0 * item["size"] / pie_total
+                color = STORAGE_COLORS.get(item["name"], "#888888")
+                arc = canvas.create_arc(cx - radius, cy - radius, cx + radius, cy + radius,
+                                        start=start, extent=extent, style=tk.PIESLICE,
+                                        fill=color, outline=t["bg"], width=2)
+                segment = {"index": index, "start": start, "extent": extent,
+                           "item": item, "arc": arc, "share": item["size"] / pie_total}
+                self.storage_segments.append(segment)
+                start += extent
+
+            canvas.create_text(cx, cy + radius + 24, text=f'Breakdown of {human(pie_total)}',
+                               fill=t["fg"], font=("Segoe UI", 9))
+
+            self.storage_table.delete(*self.storage_table.get_children())
+            for index, item in enumerate(categories):
+                share = (100.0 * item["size"] / pie_total) if pie_total else 0.0
+                self.storage_table.insert(
+                    "", "end", iid=str(index),
+                    values=(item["name"], human(item["size"]), f"{share:.1f}%",
+                            f'{item["files"]:,}', f'{item["folders"]:,}'))
+
+            self.storage_selected_index = None
+            self.storage_hint.set("Hover over a pie slice for its description and path. Right-click a slice or row to open the location.")
+
+        def _storage_hit(self, x, y):
+            if not self.storage_chart_geometry:
+                return None
+            cx, cy, radius = self.storage_chart_geometry
+            dx, dy = x - cx, cy - y
+            if math.hypot(dx, dy) > radius:
+                return None
+            angle = math.degrees(math.atan2(dy, dx)) % 360.0
+            for segment in self.storage_segments:
+                delta = (angle - segment["start"]) % 360.0
+                if delta < segment["extent"] + 0.15:
+                    return segment["index"]
+            return None
+
+        def _storage_item(self, index):
+            if not self.storage_result:
+                return None
+            items = self.storage_result["categories"]
+            return items[index] if index is not None and 0 <= index < len(items) else None
+
+        def _storage_canvas_motion(self, event):
+            index = self._storage_hit(event.x, event.y)
+            if index is None:
+                self._hide_storage_tooltip()
+                self.storage_hover_index = None
+                return
+            self.storage_hover_index = index
+            item = self._storage_item(index)
+            if item:
+                self._show_storage_tooltip(item, event.x_root, event.y_root)
+
+        def _show_storage_tooltip(self, item, x, y):
+            t = THEMES["dark" if self.dark.get() else "light"]
+            total = sum(segment["item"]["size"] for segment in self.storage_segments)
+            share = 100.0 * item["size"] / total if total else 0.0
+            text = (f'{item["name"]}\n{human(item["size"])}  ({share:.1f}% of chart)\n'
+                    f'Files: {item["files"]:,}   Folders: {item["folders"]:,}\n'
+                    f'{item["description"]}\nLocation: {item["path"]}')
+            if self.storage_tooltip is None or not self.storage_tooltip.winfo_exists():
+                self.storage_tooltip = tk.Toplevel(self)
+                self.storage_tooltip.wm_overrideredirect(True)
+                self.storage_tooltip.attributes("-topmost", True)
+                self.storage_tooltip_label = tk.Label(
+                    self.storage_tooltip, justify="left", anchor="w", wraplength=440,
+                    bg=t["field"], fg=t["fg"], relief="solid", bd=1,
+                    highlightbackground=t["border"], padx=8, pady=6)
+                self.storage_tooltip_label.pack()
+            self.storage_tooltip_label.configure(text=text)
+            self.storage_tooltip.wm_geometry(f"+{x + 16}+{y + 18}")
+
+        def _hide_storage_tooltip(self):
+            if self.storage_tooltip is not None:
+                try:
+                    self.storage_tooltip.destroy()
+                except tk.TclError:
+                    pass
+            self.storage_tooltip = None
+            self.storage_tooltip_label = None
+
+        def _storage_table_select(self, _event=None):
+            selected = self.storage_table.selection()
+            if selected:
+                try:
+                    self.storage_selected_index = int(selected[0])
+                except ValueError:
+                    self.storage_selected_index = None
+
+        def _storage_chart_right_click(self, event):
+            index = self._storage_hit(event.x, event.y)
+            self._show_storage_menu(index, event)
+
+        def _storage_table_right_click(self, event):
+            row = self.storage_table.identify_row(event.y)
+            if not row:
+                return
+            self.storage_table.selection_set(row)
+            try:
+                index = int(row)
+            except ValueError:
+                return
+            self._show_storage_menu(index, event)
+
+        def _show_storage_menu(self, index, event):
+            if self._storage_item(index) is None:
+                return
+            self.storage_selected_index = index
+            row = str(index)
+            if self.storage_table.exists(row):
+                self.storage_table.selection_set(row)
+            self.storage_menu.tk_popup(event.x_root, event.y_root)
+
+        def open_storage_location(self):
+            item = self._storage_item(self.storage_selected_index)
+            if not item:
+                return
+            path = item.get("path") or self.storage_result["drive"]
+            if not os.path.isdir(path):
+                path = os.path.dirname(path) or self.storage_result["drive"]
+            if not os.path.isdir(path):
+                path = self.storage_result["drive"]
+            try:
+                os.startfile(path)
+            except OSError as exc:
+                messagebox.showerror("Cannot open location", f"{path}\n\n{exc}")
+
+        def copy_storage_location(self):
+            item = self._storage_item(self.storage_selected_index)
+            if not item:
+                return
+            path = item.get("path") or self.storage_result["drive"]
+            self.clipboard_clear()
+            self.clipboard_append(path)
+            self.storage_status.set(f"Copied location: {path}")
 
         # ---- scanning
         def start_scan(self):
@@ -1093,6 +1539,14 @@ if tk is not None:
                         self._add(val)
                     elif kind == "progress":
                         self.status.set(val)
+                    elif kind == "storage_progress":
+                        self.storage_status.set(val)
+                    elif kind == "storage_error":
+                        self._set_storage_busy(False)
+                        self.storage_status.set(f"Storage scan failed: {val}")
+                        messagebox.showerror("Storage analysis failed", str(val))
+                    elif kind == "storage_done":
+                        self._storage_scan_done(val)
                     elif kind == "done":
                         self._set_busy(False)
                         total = sum(i.size for i in self.items.values())
