@@ -12,6 +12,14 @@ python windows_cleaner.py
 
 Requires Python 3.8+ on Windows. No extra packages.
 
+## Storage usage tab
+
+Open **Storage usage**, choose a local drive, and select **Analyze storage** to build a read-only breakdown of space used by Windows/system files, installed applications, user files, AppData, shared application data, the Recycle Bin, and other content.
+
+Hover over a pie slice to see its size, percentage, file/folder counts, description, and folder path. Right-click a slice or its category row and choose **Open location in File Explorer** to navigate to that location. You can also copy the folder path from the same menu.
+
+The scan does not change or delete files. It does not follow junctions or symbolic links, and it skips cloud-only placeholders. Some protected Windows data may not be readable; that difference is shown as **Unscanned / reserved**. Reported file sizes are logical sizes, so compression, sparse files, and hard links can make the chart differ from the drive's allocated-space figure.
+
 ## Excluded folders
 
 Click **Excluded folders...** to add any folder on your PC (any drive) that must be left alone. Excluded folders and everything inside them are never scanned, listed or deleted, and nothing that contains one is deleted either. You can also right-click a result and choose **Exclude this folder from scans**. The list is saved in `%APPDATA%\JunkCleaner\excluded_folders.json`.
